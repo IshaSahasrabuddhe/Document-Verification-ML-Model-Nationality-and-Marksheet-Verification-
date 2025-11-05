@@ -1,0 +1,101 @@
+1) High-level pipeline (what happens when you run verify_document(...))
+
+Load input image and a reference image (if available).
+
+Preprocess input for OCR (grayscale → blur → adaptive threshold).
+
+OCR using pytesseract (tries eng+Devanagari, falls back to eng).
+
+Keyword detection: exact substring matches + fuzzy matches (SequenceMatcher / difflib).
+
+Seal / symbol detection: ORB keypoints + BFMatcher between input and one or more reference seal images.
+
+Structure/layout verification: ORB keypoints on whole document, BFMatcher, compute homography (RANSAC) and warp, compute edge maps (Canny) and SSIM between edges; combine SSIM and keypoint match ratio into a single structure_score.
+
+Decision heuristic combining keyword_score, structure_score, and presence of a seal to produce verification_level (Verified / Needs Manual Verification / Rejected).
+
+Return a JSON-like result with text, detected keywords, scores, seal info, etc.
+
+2) Key algorithms / models used (summary table)
+Algorithms / Models Used
+Purpose	Algorithm / Library	Where in code	Brief description
+OCR	pytesseract (Tesseract OCR)	extract_text()	Converts preprocessed image to text. Tries eng+Devanagari then eng.
+Noise reduction / smoothing	Bilateral filter (OpenCV)	preprocess_image()	Reduces noise while preserving edges before threshold/OCR.
+Binarization for OCR	Adaptive Gaussian Threshold (OpenCV)	preprocess_image()	Adaptive threshold to handle uneven lighting.
+String similarity (fuzzy matching)	difflib.SequenceMatcher + difflib.get_close_matches	fuzzy_ratio(), check_keywords()	Measures similarity ratio between strings / finds close matches.
+Local feature detection	ORB (OpenCV)	detect_symbol(), check_document_structure()	Detects keypoints and computes descriptors (fast, binary descriptors).
+Feature matching	BFMatcher with Hamming distance and crossCheck	detect_symbol(), check_document_structure()	Matches ORB descriptors between images.
+Robust alignment	Homography via cv2.findHomography with RANSAC	check_document_structure()	Estimates perspective transform from matched keypoints, used to warp input to reference coords.
+Edge extraction	Canny edge detector (OpenCV)	check_document_structure()	Creates binary edge maps for structural SSIM comparison.
+Structural similarity	skimage.metrics.structural_similarity (SSIM)	check_document_structure()	Quantifies similarity of edge maps (0..1 typical).
+Basic heuristics / thresholds	Simple arithmetic & boolean rules	verify_document()	Combines keyword/structure/seal info to produce final decision.
+
+Note: This script uses classical computer vision and heuristics — there are no trainable ML models here (no neural nets). Tesseract is a pre-built OCR engine.
+
+3) Important configuration constants (what they mean)
+Constant	Value	Meaning / effect
+ORB_NFEATURES	1500	Number of ORB features to detect. Higher → more keypoints, slower.
+MIN_SYMBOL_MATCHES	20	Minimum BF matches to declare a seal present.
+MIN_ALIGNMENT_MATCHES	10	Minimum matches required to attempt homography alignment.
+SSIM_WEIGHT	0.6	Weight of SSIM in the structure_score composition.
+LAYOUT_WEIGHT	0.4	Weight of keypoint-layout-match ratio in structure_score.
+FUZZY_SIMILARITY_CUTOFF	0.60	Minimum similarity ratio to count as a fuzzy keyword hit.
+KEYWORD_VERIFIED_THRESHOLD	0.20	keyword_score threshold considered good for verification (20%).
+STRUCTURE_VERIFIED_THRESHOLD	0.45	structure_score threshold considered good for verification (45%).
+4) Function-by-function explanation (table + notes)
+Function	Inputs	Output	Role / details
+preprocess_image(image_path)	path	(img, thresh)	Read image as BGR → convert to gray → bilateral filter → adaptive threshold. thresh passed to OCR. Raises error if image unreadable.
+extract_text(image_path)	path	text (string)	Calls preprocess_image, then pytesseract.image_to_string using eng+Devanagari with config --oem 3 --psm 6. Falls back to eng if needed.
+fuzzy_ratio(a,b)	two strings	float [0..1]	Wrapper over SequenceMatcher.ratio() with lowercasing.
+check_keywords(text, keywords)	text, list[keywords]	(detected_exact, fuzzy_hits)	1) exact substring matches (case-insensitive). 2) For remaining keywords, compute full_ratio (keyword vs whole text) and best_window_ratio (slide a token window of size ~keyword tokens across OCR words), keep the max. Also uses difflib.get_close_matches for single-token kws. If best_ratio >= FUZZY_SIMILARITY_CUTOFF then mark fuzzy hit. Returns lists/dicts.
+detect_symbol(image_path, reference_symbol_path)	input image, reference symbol image	(bool_detected, num_matches)	ORB detect on both → compute descriptors → BFMatcher (Hamming, crossCheck) → len(matches). If len >= MIN_SYMBOL_MATCHES, returns True.
+detect_any_symbol(image_path, seal_paths)	input image, sequence of candidate seal image paths	(detected_bool, matches, used_path)	Tries candidates sequentially, returns first that passes the threshold. Tracks best candidate even if none pass.
+check_document_structure(image_path, reference_doc_path)	input, reference document image	(overall_score, num_matches)	Full structure check: resize/ref equalization → ORB detect & BF match → if num_matches < MIN_ALIGNMENT_MATCHES, compute SSIM on edges without homography and combine with layout_match_ratio = num_matches / len(kp1). If enough matches, compute homography H (RANSAC), warp input to ref, build Canny edge maps on aligned input and ref, compute structure_score = ssim(edges_input, edges_ref). Combine structure_score and layout_match_ratio into overall_score = SSIM_WEIGHT * structure_score + LAYOUT_WEIGHT * layout_match_ratio. Return score and count of matches.
+verify_document(image_path, doc_category, doc_type, ref_folder)	image, category, type, ref folder	dict of results	Orchestrates OCR, keyword detection, structure check, seal detection, then applies final decision logic to produce verification_level and the result dict.
+main()	CLI args	prints JSON	CLI wrapper to call verify_document and print results.
+5) Exact scoring math used
+
+keyword_score = len(detected_keywords) / len(keywords) (if the keyword set is present).
+Example: if 5 exact keywords detected out of 20 keywords → keyword_score = 5/20 = 0.25.
+
+layout_match_ratio = num_matches / max(len(kp1), 1)
+(where num_matches is number of BF matches between input and reference ORB descriptors; kp1 are keypoints in the input).
+
+structure_score produced by SSIM on Canny edge maps (value roughly in [0,1], but can be negative in pathological cases — they attempt to convert to float and catch exceptions). Then:
+
+overall_score = (structure_score * SSIM_WEIGHT) + (layout_match_ratio * LAYOUT_WEIGHT)
+
+
+With SSIM_WEIGHT = 0.6, LAYOUT_WEIGHT = 0.4.
+
+Decision rules (simplified):
+
+If keyword_score >= KEYWORD_VERIFIED_THRESHOLD and structure_score > STRUCTURE_VERIFIED_THRESHOLD and (seal detected OR doc type does not require seal) → "Verified".
+
+Else if keyword_score > 0.15 or structure_score > 0.2 → "Needs Manual Verification".
+
+Else → "Rejected".
+
+6) Example numeric walkthrough (toy)
+
+Assume: doc_type='ssc', len(SSC_KEYWORDS)=20, OCR found 6 exact keywords and 3 fuzzy hits (fuzzy hits don't directly increment keyword_score — only detected_exact used in score), ORB matching yields 50 matches, input had 100 keypoints, SSIM on edge maps is 0.72.
+
+keyword_score = 6 / 20 = 0.30 → > 0.20 threshold (good).
+
+layout_match_ratio = 50 / 100 = 0.50.
+
+structure_score = 0.72.
+
+overall_score = 0.72*0.6 + 0.50*0.4 = 0.432 + 0.20 = 0.632.
+
+Since keyword_score >= 0.20 AND structure_score > 0.45 AND seal is detected (assume True) → verification_level = "Verified".
+
+7) Where each model/algorithm is best-suited / why chosen
+
+Tesseract OCR: robust, offline, supports multiple languages (here Marathi via Devanagari). Good for printed text, less good for handwriting or very noisy scans.
+
+ORB + BFMatcher: ORB is fast and free (patent-unencumbered) and produces binary descriptors (match with Hamming). Good for logo/seal detection and detecting consistent document layout elements. Not as robust as SIFT/SURF on difficult transformations but fast.
+
+Homography + RANSAC: standard approach for aligning two images under projective transform (skewed photos). RANSAC rejects outliers.
+
+Canny + SSIM on edges: SSIM on edge maps focuses on structure/line layout similarity rather than color; good for comparing printed forms where text blocks, tables, and separators matter.
