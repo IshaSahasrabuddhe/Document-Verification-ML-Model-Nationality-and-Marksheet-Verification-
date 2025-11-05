@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+verification.py
+
+Lightweight document verification (no torch/easyocr)
+- OCR via pytesseract (English + Devanagari)
+- Keyword detection (exact + fuzzy)
+- Symbol / seal detection via ORB
+- Structure/layout verification via ORB + SSIM on edges
+"""
+
+import os
+import argparse
+import json
+import difflib
+import cv2
+import numpy as np
+import pytesseract
+from skimage.metrics import structural_similarity as ssim
+
+# ------------------- CONFIG -------------------
+ORB_NFEATURES = 1500
+MIN_SYMBOL_MATCHES = 20
+MIN_ALIGNMENT_MATCHES = 10
+SSIM_WEIGHT = 0.6
+LAYOUT_WEIGHT = 0.4
+
+# ------------------- KEYWORDS -------------------
+SSC_KEYWORDS = [
+    "महाराष्ट्र राज्य माध्यमिक व उच्च माध्यमिक शिक्षण मंडळ",
+    "Maharashtra State Board Of Secondary and Higher Secondary Education, Pune",
+    "पुणे विभागीय मंडळ", "PUNE DIVISIONAL BOARD",
+    "माध्यमिक शालान्त प्रमाणपत्र परीक्षा गुणपत्रक",
+    "SECONDARY SCHOOL CERTIFICATE EXAMINATION - STATEMENT OF MARKS",
+    "आसन क्रमांक", "SEAT NO.", "DIST. & SCHOOL NO.", "YEAR OF EXAM",
+    "CENTRE NO.", "SR.NO. OF STATEMENT", "CANDIDATE'S FULL NAME",
+    "CANDIDATE'S MOTHER'S NAME", "Subject Code No. and Subject Name",
+    "Marks or Grade Obtained", "In Words", "Percentage", "Result"
+]
+
+HSC_KEYWORDS = [
+    "Maharashtra State Board Of Secondary and Higher Secondary Education",
+    "HIGHER SECONDARY CERTIFICATE EXAMINATION", "PUNE DIVISIONAL BOARD",
+    "SEAT NO.", "CENTRE NO", "MONTH & YEAR OF EXAM",
+    "CANDIDATE'S FULL NAME", "CANDIDATE'S MOTHER'S NAME",
+    "Subject Code No. and Subject Name", "Marks or Grade Obtained",
+    "In Words", "Percentage", "Result", "Divisional Secretary"
+]
+
+CET_KEYWORDS = [
+    "Government of Maharashtra",
+    "State Common Entrance Test Cell, Maharashtra State, Mumbai",
+    "MHT-CET", "Application Number", "Candidate's Full Name",
+    "Roll No", "Category", "Physics", "Chemistry", "Mathematics",
+    "Total Percentile Score", "Date of the Result"
+]
+
+PASSPORT_KEYWORDS = [
+    "REPUBLIC OF INDIA", "Indian Passport", "Address", "Name of Father",
+    "Name of Mother", "Passport No.", "Given Name", "Date of Birth",
+    "Place of Birth", "Sex", "Date of Issue", "Date of Expiry", "Place of Issue"
+]
+
+DOMICILE_KEYWORDS = [
+    "Tahsil Office", "Certificate of Age, Nationality and Domicile",
+    "Issued by Authorities in the State of Maharashtra",
+    "State of 'MAHARASHTRA'", "Nationality", "Domicile", "Certificate",
+    "CITIZEN OF INDIA", "Signature valid", "Seal"
+]
+
+# ------------------- PREPROCESSING -------------------
+def preprocess_image(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Cannot read image: {image_path}")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 11, 2)
+    return img, thresh
+
+# ------------------- OCR (Tesseract) -------------------
+def extract_text(image_path):
+    _, pre = preprocess_image(image_path)
+    config = r'--oem 3 --psm 6'
+    try:
+        # English + Devanagari (Marathi)
+        return pytesseract.image_to_string(pre, lang='eng+Devanagari', config=config)
+    except Exception:
+        return pytesseract.image_to_string(pre, lang='eng', config=config)
+
+# ------------------- KEYWORD DETECTION -------------------
+def check_keywords(text, keywords):
+    detected = [kw for kw in keywords if kw.lower() in text.lower()]
+    words = text.split()
+    fuzzy = {kw: difflib.get_close_matches(kw, words, n=1, cutoff=0.6) for kw in keywords}
+    return detected, fuzzy
+
+# ------------------- SYMBOL DETECTION -------------------
+def detect_symbol(image_path, ref_symbol_path):
+    img = cv2.imread(image_path)
+    ref = cv2.imread(ref_symbol_path)
+    if img is None or ref is None:
+        return False, 0
+    orb = cv2.ORB_create()
+    kp1, des1 = orb.detectAndCompute(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), None)
+    kp2, des2 = orb.detectAndCompute(cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY), None)
+    if des1 is None or des2 is None:
+        return False, 0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    return len(matches) > MIN_SYMBOL_MATCHES, len(matches)
+
+# ------------------- STRUCTURE VERIFICATION -------------------
+def check_document_structure(image_path, reference_doc_path):
+    img = cv2.imread(image_path)
+    ref = cv2.imread(reference_doc_path)
+    if img is None or ref is None:
+        return 0.0, 0
+    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    ref_gray = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
+    ref_gray = cv2.resize(ref_gray, (img_gray.shape[1], img_gray.shape[0]))
+    orb = cv2.ORB_create(nfeatures=ORB_NFEATURES)
+    kp1, des1 = orb.detectAndCompute(img_gray, None)
+    kp2, des2 = orb.detectAndCompute(ref_gray, None)
+    if des1 is None or des2 is None:
+        return 0.0, 0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    num_matches = len(matches)
+    edges1 = cv2.Canny(img_gray, 80, 200)
+    edges2 = cv2.Canny(ref_gray, 80, 200)
+    structure_score = ssim(edges1, edges2)
+    layout_score = num_matches / max(len(kp1), 1)
+    return (structure_score * SSIM_WEIGHT) + (layout_score * LAYOUT_WEIGHT), num_matches
+
+# ------------------- VERIFICATION LOGIC -------------------
+def verify_document(image_path, doc_category, doc_type, ref_folder='reference_documents'):
+    ref_file = f"{doc_type.lower()}_ref.jpg"
+    ref_path = os.path.join(ref_folder, doc_category.lower(), ref_file)
+
+    doc_type_l = doc_type.lower()
+    keywords = {
+        'ssc': SSC_KEYWORDS,
+        'hsc': HSC_KEYWORDS,
+        'cet': CET_KEYWORDS,
+        'passport': PASSPORT_KEYWORDS,
+        'domicile': DOMICILE_KEYWORDS
+    }.get(doc_type_l, [])
+
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"File not found: {image_path}")
+
+    text = extract_text(image_path)
+    detected, fuzzy = check_keywords(text, keywords)
+    keyword_score = len(detected) / len(keywords) if keywords else 0
+
+    structure_score, structure_matches = (0.0, 0)
+    if os.path.exists(ref_path):
+        structure_score, structure_matches = check_document_structure(image_path, ref_path)
+
+    seal_detected, seal_matches = False, 0
+    if doc_type_l in ['passport', 'domicile', 'ssc', 'hsc']:
+        seal_detected, seal_matches = detect_symbol(image_path, ref_path)
+
+    if keyword_score >= 0.4 and structure_score > 0.5:
+        verification_level = "Verified"
+    elif keyword_score > 0.15 or structure_score > 0.2:
+        verification_level = "Needs Manual Verification"
+    else:
+        verification_level = "Rejected"
+
+    return {
+        'keyword_score': round(keyword_score, 3),
+        'structure_score': round(structure_score, 3),
+        'structure_matches': structure_matches,
+        'seal_detected': seal_detected,
+        'seal_matches': seal_matches,
+        'verification_level': verification_level,
+        'detected_keywords': detected,
+        'fuzzy_matches': {k: v for k, v in fuzzy.items() if v},
+        'text': text
+    }
+
+# ------------------- CLI -------------------
+def main():
+    parser = argparse.ArgumentParser(description="Document verification tool (no DLLs)")
+    parser.add_argument('-i', '--image', required=True)
+    parser.add_argument('-c', '--doc_category', default='general')
+    parser.add_argument('-t', '--doc_type', required=True)
+    parser.add_argument('-r', '--ref_folder', default='reference_documents')
+    parser.add_argument('--pretty', action='store_true')
+    args = parser.parse_args()
+
+    result = verify_document(args.image, args.doc_category, args.doc_type, args.ref_folder)
+    print(json.dumps(result, indent=2 if args.pretty else None, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()

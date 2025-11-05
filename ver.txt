@@ -1,0 +1,217 @@
+import cv2
+import pytesseract
+import numpy as np
+import difflib
+from skimage.metrics import structural_similarity as ssim
+import os
+
+# Define keywords for each document type
+SSC_KEYWORDS = [
+    "Maharashtra State Board Of Secondary and Higher Secondary Education, Pune",
+    "SECONDARY SCHOOL CERTIFICATE EXAMINATION - STATEMENT OF MARKS",
+    "SEAT NO.", "DIST. & SCHOOL NO.", "YEAR OF EXAM", "CENTRE NO.",
+    "CANDIDATE'S FULL NAME", "CANDIDATE'S MOTHER'S NAME", "Result"
+]
+SSC_IDENTIFIERS = ["SECONDARY SCHOOL CERTIFICATE EXAMINATION", "Maharashtra State Board"]
+
+HSC_KEYWORDS = [
+    "Maharashtra State Board Of Secondary and Higher Secondary Education",
+    "HIGHER SECONDARY CERTIFICATE EXAMINATION",
+    "STREAM", "SEAT NO.", "CENTRE NO",
+    "MONTH & YEAR OF EXAM", "CANDIDATE'S FULL NAME",
+    "CANDIDATE'S MOTHER'S NAME", "Result"
+]
+
+CET_KEYWORDS = [
+    "Government of Maharashtra",
+    "State Common Entrance Test Cell, Maharashtra State, Mumbai",
+    "MHT-CET (PCM Group) Score Card",
+    "Application Number", "Candidate's Full Name", "Roll No",
+    "MHT CET Percentile Score", "Total Percentile Score PCM"
+]
+CET_IDENTIFIERS = ["MHT-CET (PCM Group) Score Card", "Government of Maharashtra"]
+
+PASSPORT_KEYWORDS = [
+    "REPUBLIC OF INDIA", "IND", "INDIAN", "Indian Passport", "Address", "Name of Father",
+    "Name of Mother", "MAHARASHTRA", "Type", "Code", "Passport No.", "Surname",
+    "Given Name(s)", "Nationality", "Date of Birth", "Place of Birth", "Sex",
+    "Date of Issue", "Date of Expiry", "Place of Issue",
+    "भारताचे प्रजासत्ताक", "भारतीय", "पत्ता", "वडिलांचे नाव", "मातेचे नाव", "लिंग",
+    "जन्म तारीख", "जन्म स्थान", "राष्ट्रीयत्व", "जारी तारीख", "कालबाह्यता तारीख", "जारी ठिकाण"
+]
+
+DOMICILE_KEYWORDS = [
+    "Tahsil Office", "Certificate of Age, Nationality and Domicile", "Issued by Authorities in the State of Maharashtra",
+    "issued by Authorities in the State of Maharashtra", "State of 'MAHARASHTRA'", "Nationality", "Domicile", "Certificate",
+    "CITIZEN OF INDIA", "PARTICULARS OF PROOFS SUBMITTED", "Signature valid", "Seal"
+]
+
+# Preprocessing
+def preprocess_image(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Could not read image at {image_path}")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
+    return img, thresh
+
+# Crop to Main Layout Area
+def crop_main_content(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Could not read image at {image_path}")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)[1]
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return img  # fallback if no contour found
+
+    contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(contour)
+
+    pad = 10
+    y1, y2 = max(y - pad, 0), min(y + h + pad, img.shape[0])
+    x1, x2 = max(x - pad, 0), min(x + w + pad, img.shape[1])
+
+    cropped = img[y1:y2, x1:x2]
+    return cropped
+
+# Extract Text Using Tesseract
+def extract_text(image_path):
+    try:
+        cropped = crop_main_content(image_path)
+        gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+        config = r'--oem 3 --psm 6'
+        text = pytesseract.image_to_string(gray, config=config)
+        return text
+    except Exception as e:
+        print(f"Error extracting text: {e}")
+        return ""
+
+# Keyword Checking
+def check_keywords(text, keywords):
+    detected_keywords = [kw for kw in keywords if kw.lower() in text.lower()]
+    fuzzy_matches = {
+        kw: difflib.get_close_matches(kw, text.split(), n=1, cutoff=0.6)
+        for kw in keywords
+    }
+    return detected_keywords, fuzzy_matches
+
+# Symbol Detection using ORB
+def detect_symbol(image_path, reference_symbol_path):
+    try:
+        original_img = cv2.imread(image_path)
+        reference_symbol = cv2.imread(reference_symbol_path)
+        
+        if original_img is None or reference_symbol is None:
+            return False, 0
+            
+        original_gray = cv2.cvtColor(original_img, cv2.COLOR_BGR2GRAY)
+        reference_gray = cv2.cvtColor(reference_symbol, cv2.COLOR_BGR2GRAY)
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.detectAndCompute(original_gray, None)
+        kp2, des2 = orb.detectAndCompute(reference_gray, None)
+        if des1 is None or des2 is None:
+            return False, 0
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(des1, des2)
+        return (len(matches) > 20), len(matches)
+    except Exception as e:
+        print(f"Error detecting symbol: {e}")
+        return False, 0
+
+# Structure / Layout Verification
+def check_document_structure(image_path, reference_doc_path):
+    try:
+        input_img = crop_main_content(image_path)
+        
+        # Check if reference document exists
+        if not os.path.exists(reference_doc_path):
+            print(f"Reference document not found: {reference_doc_path}")
+            return 0.0, 0
+            
+        ref_img = crop_main_content(reference_doc_path)
+        
+        if ref_img is None:
+            print(f"Could not read reference document: {reference_doc_path}")
+            return 0.0, 0
+            
+        input_gray = cv2.cvtColor(input_img, cv2.COLOR_BGR2GRAY)
+        ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
+        ref_gray = cv2.resize(ref_gray, (input_gray.shape[1], input_gray.shape[0]))
+        edges_input = cv2.Canny(input_gray, 100, 200)
+        edges_ref = cv2.Canny(ref_gray, 100, 200)
+        structure_score, _ = ssim(edges_input, edges_ref, full=True)
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.detectAndCompute(input_gray, None)
+        kp2, des2 = orb.detectAndCompute(ref_gray, None)
+        if des1 is None or des2 is None:
+            return 0.0, 0
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(des1, des2)
+        layout_match_ratio = len(matches) / max(len(kp1), 1)
+        overall_score = (structure_score * 0.6) + (layout_match_ratio * 0.4)
+        return overall_score, len(matches)
+    except Exception as e:
+        print(f"Error checking document structure: {e}")
+        return 0.0, 0
+
+def verify_document(image_path, doc_category, doc_type):
+    # Get reference document path
+    ref_path = os.path.join('reference_documents', doc_category.lower(), f"{doc_type.lower()}_ref.jpg")
+    
+    # Get keywords based on document type
+    if doc_type.lower() == 'ssc':
+        keywords = SSC_KEYWORDS
+    elif doc_type.lower() == 'hsc':
+        keywords = HSC_KEYWORDS
+    elif doc_type.lower() == 'cet':
+        keywords = CET_KEYWORDS
+    elif doc_type.lower() == 'passport':
+        keywords = PASSPORT_KEYWORDS
+    elif doc_type.lower() == 'domicile':
+        keywords = DOMICILE_KEYWORDS
+    else:
+        keywords = []
+    
+    # Extract text from document
+    text = extract_text(image_path)
+    
+    # Check keywords
+    detected_keywords, fuzzy_matches = check_keywords(text, keywords)
+    keyword_score = len(detected_keywords) / len(keywords) if keywords else 0
+    
+    # Check document structure
+    structure_score, structure_matches = check_document_structure(image_path, ref_path)
+    
+    # Check for seal/logo (if applicable)
+    seal_detected = False
+    seal_matches = 0
+    if doc_type.lower() in ['passport', 'domicile']:
+        seal_detected, seal_matches = detect_symbol(image_path, ref_path)
+    
+    # Determine verification level
+    if keyword_score > 0.5 and structure_score > 0.5 and (seal_detected or doc_type.lower() not in ['passport', 'domicile']):
+        verification_level = "Verified"
+    elif keyword_score > 0.4 or structure_score > 0.4:
+        verification_level = "Needs Manual Verification"
+    else:
+        verification_level = "Rejected"
+    
+    return {
+        'text': text,
+        'detected_keywords': detected_keywords,
+        'keyword_score': keyword_score,
+        'structure_score': structure_score,
+        'structure_matches': structure_matches,
+        'seal_detected': seal_detected,
+        'seal_matches': seal_matches,
+        'verification_level': verification_level,
+        'doc_type': doc_type,
+        'doc_category': doc_category
+    }

@@ -1,0 +1,235 @@
+import os
+import cv2
+import pytesseract
+import numpy as np
+import difflib
+from skimage.metrics import structural_similarity as ssim
+from flask import Flask, render_template, request, redirect, url_for, flash
+from werkzeug.utils import secure_filename
+import uuid
+
+app = Flask(__name__)
+app.secret_key = 'your_secret_key_here'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload size
+
+# Ensure upload folder exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Document type keywords
+SSC_KEYWORDS = [
+    "Maharashtra State Board Of Secondary and Higher Secondary Education, Pune",
+    "SECONDARY SCHOOL CERTIFICATE EXAMINATION - STATEMENT OF MARKS",
+    "SEAT NO.", "DIST. & SCHOOL NO.", "YEAR OF EXAM", "CENTRE NO.",
+    "CANDIDATE'S FULL NAME", "CANDIDATE'S MOTHER'S NAME", "Result"
+]
+SSC_IDENTIFIERS = ["SECONDARY SCHOOL CERTIFICATE EXAMINATION", "Maharashtra State Board"]
+
+HSC_KEYWORDS = [
+    "Maharashtra State Board Of Secondary and Higher Secondary Education",
+    "HIGHER SECONDARY CERTIFICATE EXAMINATION",
+    "STREAM", "SEAT NO.", "CENTRE NO",
+    "MONTH & YEAR OF EXAM", "CANDIDATE'S FULL NAME",
+    "CANDIDATE'S MOTHER'S NAME", "Result"
+]
+
+CET_KEYWORDS = [
+    "Government of Maharashtra",
+    "State Common Entrance Test Cell, Maharashtra State, Mumbai",
+    "MHT-CET (PCM Group) Score Card",
+    "Application Number", "Candidate's Full Name", "Roll No",
+    "MHT CET Percentile Score", "Total Percentile Score PCM"
+]
+CET_IDENTIFIERS = ["MHT-CET (PCM Group) Score Card", "Government of Maharashtra"]
+
+PASSPORT_KEYWORDS = [
+    "REPUBLIC OF INDIA", "IND", "INDIAN", "Indian Passport", "Address", "Name of Father",
+    "Name of Mother", "MAHARASHTRA", "Type", "Code", "Passport No.", "Surname",
+    "Given Name(s)", "Nationality", "Date of Birth", "Place of Birth", "Sex",
+    "Date of Issue", "Date of Expiry", "Place of Issue",
+    "भारताचे प्रजासत्ताक", "भारतीय", "पत्ता", "वडिलांचे नाव", "मातेचे नाव", "लिंग",
+    "जन्म तारीख", "जन्म स्थान", "राष्ट्रीयत्व", "जारी तारीख", "कालबाह्यता तारीख", "जारी ठिकाण"
+]
+
+DOMICILE_KEYWORDS = [
+    "Tahsil Office", "Certificate of Age, Nationality and Domicile", "Issued by Authorities in the State of Maharashtra",
+    "issued by Authorities in the State of Maharashtra", "State of 'MAHARASHTRA'", "Nationality", "Domicile", "Certificate",
+    "CITIZEN OF INDIA", "PARTICULARS OF PROOFS SUBMITTED", "Signature valid", "Seal"
+]
+
+# Document type to keywords mapping
+DOCUMENT_KEYWORDS = {
+    'passport': PASSPORT_KEYWORDS,
+    'domicile': DOMICILE_KEYWORDS,
+    'ssc': SSC_KEYWORDS,
+    'hsc': HSC_KEYWORDS,
+    'cet': CET_KEYWORDS
+}
+
+# Document type to reference file mapping
+REFERENCE_FILES = {
+    'passport': 'reference_documents/nationality/passport_ref.jpg',
+    'domicile': 'reference_documents/nationality/domicile_ref.jpg',
+    'ssc': 'reference_documents/marksheet/ssc_ref.jpg',
+    'hsc': 'reference_documents/marksheet/hsc_ref.jpg',
+    'cet': 'reference_documents/marksheet/cet_ref.jpg'
+}
+
+# Helper functions for document verification
+def preprocess_image(image_path):
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
+    return img, thresh
+
+def crop_main_content(image_path):
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)[1]
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return img  # fallback if no contour found
+
+    contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(contour)
+
+    pad = 10
+    y1, y2 = max(y - pad, 0), min(y + h + pad, img.shape[0])
+    x1, x2 = max(x - pad, 0), min(x + w + pad, img.shape[1])
+
+    cropped = img[y1:y2, x1:x2]
+    return cropped
+
+def extract_text(image_path):
+    cropped = crop_main_content(image_path)
+    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+    config = r'--oem 3 --psm 6'
+    text = pytesseract.image_to_string(gray, config=config)
+    return text
+
+def check_keywords(text, keywords):
+    detected_keywords = [kw for kw in keywords if kw.lower() in text.lower()]
+    fuzzy_matches = {
+        kw: difflib.get_close_matches(kw, text.split(), n=1, cutoff=0.6)
+        for kw in keywords
+    }
+    return detected_keywords, fuzzy_matches
+
+def detect_symbol(image_path, reference_symbol_path):
+    original_img = cv2.imread(image_path)
+    reference_symbol = cv2.imread(reference_symbol_path)
+    original_gray = cv2.cvtColor(original_img, cv2.COLOR_BGR2GRAY)
+    reference_gray = cv2.cvtColor(reference_symbol, cv2.COLOR_BGR2GRAY)
+    orb = cv2.ORB_create()
+    kp1, des1 = orb.detectAndCompute(original_gray, None)
+    kp2, des2 = orb.detectAndCompute(reference_gray, None)
+    if des1 is None or des2 is None:
+        return False, 0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    return (len(matches) > 20), len(matches)
+
+def check_document_structure(image_path, reference_doc_path):
+    input_img = crop_main_content(image_path)
+    ref_img = crop_main_content(reference_doc_path)
+    input_gray = cv2.cvtColor(input_img, cv2.COLOR_BGR2GRAY)
+    ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
+    ref_gray = cv2.resize(ref_gray, (input_gray.shape[1], input_gray.shape[0]))
+    edges_input = cv2.Canny(input_gray, 100, 200)
+    edges_ref = cv2.Canny(ref_gray, 100, 200)
+    structure_score, _ = ssim(edges_input, edges_ref, full=True)
+    orb = cv2.ORB_create()
+    kp1, des1 = orb.detectAndCompute(input_gray, None)
+    kp2, des2 = orb.detectAndCompute(ref_gray, None)
+    if des1 is None or des2 is None:
+        return 0.0, 0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    layout_match_ratio = len(matches) / max(len(kp1), 1)
+    overall_score = (structure_score * 0.6) + (layout_match_ratio * 0.4)
+    return overall_score, len(matches)
+
+def verify_document(image_path, document_type):
+    # Get the appropriate keywords and reference file
+    keywords = DOCUMENT_KEYWORDS.get(document_type, [])
+    reference_file = REFERENCE_FILES.get(document_type, "")
+    
+    if not keywords or not reference_file or not os.path.exists(reference_file):
+        return {
+            "status": "error",
+            "message": "Invalid document type or reference file not found"
+        }
+    
+    # Extract text from the document
+    text = extract_text(image_path)
+    
+    # Check for keywords
+    detected_keywords, fuzzy_matches = check_keywords(text, keywords)
+    keyword_match_ratio = len(detected_keywords) / len(keywords)
+    
+    # Check document structure
+    structure_score, structure_matches = check_document_structure(image_path, reference_file)
+    
+    # Detect symbols (seals/logos)
+    symbol_detected, symbol_matches = detect_symbol(image_path, reference_file)
+    
+    # Determine verification status
+    if keyword_match_ratio >= 0.7 and structure_score >= 0.6 and symbol_detected:
+        status = "Verified"
+    elif keyword_match_ratio >= 0.4 or structure_score >= 0.3:
+        status = "Needs Manual Verification"
+    else:
+        status = "Rejected"
+    
+    return {
+        "status": status,
+        "extracted_text": text,
+        "detected_keywords": detected_keywords,
+        "keyword_match_ratio": keyword_match_ratio,
+        "structure_score": structure_score,
+        "structure_matches": structure_matches,
+        "symbol_detected": symbol_detected,
+        "symbol_matches": symbol_matches
+    }
+
+# Flask routes
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/verify', methods=['POST'])
+def verify():
+    if 'document' not in request.files:
+        flash('No file part')
+        return redirect(request.url)
+    
+    file = request.files['document']
+    document_type = request.form.get('document_type')
+    
+    if file.filename == '':
+        flash('No selected file')
+        return redirect(request.url)
+    
+    if file and document_type:
+        # Generate a unique filename to avoid conflicts
+        filename = str(uuid.uuid4()) + '_' + secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        # Verify the document
+        result = verify_document(filepath, document_type)
+        
+        # Clean up the uploaded file
+        os.remove(filepath)
+        
+        return render_template('result.html', result=result, document_type=document_type)
+    
+    return redirect(url_for('index'))
+
+if __name__ == '__main__':
+    app.run(debug=True)

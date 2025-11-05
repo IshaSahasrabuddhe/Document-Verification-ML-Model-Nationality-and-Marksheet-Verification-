@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document Verification System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="row justify-content-center">
+            <div class="col-md-8">
+                <div class="card">
+                    <div class="card-header bg-primary text-white">
+                        <h2 class="text-center">Document Verification System</h2>
+                    </div>
+                    <div class="card-body">
+                        {% with messages = get_flashed_messages() %}
+                            {% if messages %}
+                                {% for message in messages %}
+                                    <div class="alert alert-danger alert-dismissible fade show" role="alert">
+                                        {{ message }}
+                                        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                                    </div>
+                                {% endfor %}
+                            {% endif %}
+                        {% endwith %}
+                        
+                        <form action="/verify" method="post" enctype="multipart/form-data" id="verificationForm">
+                            <div class="mb-3">
+                                <label for="docCategory" class="form-label">Document Category</label>
+                                <select class="form-select" id="docCategory" name="doc_category" required>
+                                    <option value="" selected disabled>Select Document Category</option>
+                                    <option value="nationality">Nationality</option>
+                                    <option value="marksheet">Marksheet</option>
+                                </select>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="docType" class="form-label">Document Type</label>
+                                <select class="form-select" id="docType" name="doc_type" required disabled>
+                                    <option value="" selected disabled>Select Document Type</option>
+                                </select>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="fileUpload" class="form-label">Upload Document Image</label>
+                                <input class="form-control" type="file" id="fileUpload" name="file" accept="image/*" required>
+                                <div class="form-text">Please upload a clear image of your document.</div>
+                            </div>
+                            
+                            <div class="mb-3 text-center">
+                                <img id="preview" class="img-fluid mt-3" style="max-height: 300px; display: none;">
+                            </div>
+                            
+                            <div class="d-grid">
+                                <button type="submit" class="btn btn-primary" id="submitBtn" disabled>Verify Document</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>

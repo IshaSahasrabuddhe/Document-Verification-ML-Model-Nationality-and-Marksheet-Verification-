@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""
+verification.py
+
+Lightweight document verification (no torch/easyocr)
+- OCR via pytesseract (English + Devanagari)
+- Keyword detection (exact + fuzzy)
+- Symbol / seal detection via ORB (with multi-seal fallback)
+- Structure/layout verification via ORB + SSIM on edges
+- CLI wrapper for quick testing
+
+This is the full verification.py with added multi-seal fallback:
+- For marksheets we will attempt to find: {doc_type}_seal.jpg,
+  {doc_type}_seal_alt.jpg, {doc_type}_seal2.jpg (if present)
+- Falls back to using the main reference image as a seal reference if no seal files found
+"""
+
+import os
+import argparse
+import json
+import difflib
+import cv2
+import numpy as np
+import pytesseract
+from skimage.metrics import structural_similarity as ssim
+from difflib import SequenceMatcher
+
+# ------------------- CONFIG / THRESHOLDS -------------------
+ORB_NFEATURES = 1500
+MIN_SYMBOL_MATCHES = 20        # matches required to say seal present
+MIN_ALIGNMENT_MATCHES = 10     # matches required to attempt homography
+SSIM_WEIGHT = 0.6
+LAYOUT_WEIGHT = 0.4
+FUZZY_SIMILARITY_CUTOFF = 0.60  # sequence matcher ratio to consider fuzzy hit
+KEYWORD_VERIFIED_THRESHOLD = 0.20
+STRUCTURE_VERIFIED_THRESHOLD = 0.45
+
+# ------------------- KEYWORDS -------------------
+SSC_KEYWORDS = [
+    "महाराष्ट्र राज्य माध्यमिक व उच्च माध्यमिक शिक्षण मंडळ",
+    "Maharashtra State Board Of Secondary and Higher Secondary Education, Pune",
+    "पुणे विभागीय मंडळ", "PUNE DIVISIONAL BOARD",
+    "माध्यमिक शालान्त प्रमाणपत्र परीक्षा गुणपत्रक",
+    "SECONDARY SCHOOL CERTIFICATE EXAMINATION - STATEMENT OF MARKS",
+    "आसन क्रमांक", "SEAT NO.", "DIST. & SCHOOL NO.", "YEAR OF EXAM",
+    "CENTRE NO.", "SR.NO. OF STATEMENT", "CANDIDATE'S FULL NAME",
+    "CANDIDATE'S MOTHER'S NAME", "Subject Code No. and Subject Name",
+    "Marks or Grade Obtained", "In Words", "Percentage", "Result"
+]
+
+HSC_KEYWORDS = [
+    "Maharashtra State Board Of Secondary and Higher Secondary Education",
+    "HIGHER SECONDARY CERTIFICATE EXAMINATION", "PUNE DIVISIONAL BOARD",
+    "SEAT NO.", "CENTRE NO", "MONTH & YEAR OF EXAM",
+    "CANDIDATE'S FULL NAME", "CANDIDATE'S MOTHER'S NAME",
+    "Subject Code No. and Subject Name", "Marks or Grade Obtained",
+    "In Words", "Percentage", "Result", "Divisional Secretary"
+]
+
+CET_KEYWORDS = [
+    "Government of Maharashtra",
+    "State Common Entrance Test Cell, Maharashtra State, Mumbai",
+    "MHT-CET", "Application Number", "Candidate's Full Name",
+    "Roll No", "Category", "Physics", "Chemistry", "Mathematics",
+    "Total Percentile Score", "Date of the Result"
+]
+
+AADHAAR_KEYWORDS = [
+    "Government of India", "भारत सरकार", "Unique Identification Authority of India", "भारतीय विशिष्ट ओळख प्राधिकरण", "UIDAI", 
+    "Aadhaar", "आधार", "Enrolment No.", "Enrollment No.", "Aadhaar No.", "Your Aadhaar Number", "VID", "QR Code", "Signature valid", "Date of Birth", "DOB", 
+    "Year of Birth", "YOB", "Gender", "Male", "Female", "D/O", "S/O", "W/O", "Address", "पत्ता", "INFORMATION", "Issue Date", "माझे आधार माझी ओळख"
+]
+
+DOMICILE_KEYWORDS = [
+    "Tahsil Office", "Certificate of Age, Nationality and Domicile",
+    "Issued by Authorities in the State of Maharashtra",
+    "State of 'MAHARASHTRA'", "Nationality", "Domicile", "Certificate",
+    "CITIZEN OF INDIA", "Signature valid", "Seal"
+]
+
+# mapping for selection
+KEYWORD_SETS = {
+    'ssc': SSC_KEYWORDS,
+    'hsc': HSC_KEYWORDS,
+    'cet': CET_KEYWORDS,
+    'aadhaar': AADHAAR_KEYWORDS,
+    'domicile': DOMICILE_KEYWORDS
+}
+
+# ------------------- UTIL: Preprocessing & OCR -------------------
+def preprocess_image(image_path):
+    """Read image, convert to grayscale and adaptive threshold.
+    Returns original BGR image and preprocessed grayscale image for OCR."""
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Could not read image at: {image_path}")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # slight blur to reduce noise
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    # adaptive threshold helps OCR on uneven lighting
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 11, 2)
+    return img, thresh
+
+
+def extract_text(image_path):
+    """Extract text using pytesseract. Try Marathi+English first, fallback to English."""
+    try:
+        _, pre = preprocess_image(image_path)
+    except Exception as e:
+        raise RuntimeError(f"Preprocessing failed: {e}")
+    # prefer eng+Devanagari for Marathi + English documents
+    config = r'--oem 3 --psm 6'
+    try:
+        text = pytesseract.image_to_string(pre, lang='eng+Devanagari', config=config)
+        if not text.strip():
+            # fallback to eng only
+            text = pytesseract.image_to_string(pre, lang='eng', config=config)
+    except Exception:
+        # fallback
+        text = pytesseract.image_to_string(pre, lang='eng', config=config)
+    return text
+
+
+# ------------------- KEYWORD DETECTION -------------------
+def fuzzy_ratio(a: str, b: str) -> float:
+    """Return a quick similarity ratio between two strings using SequenceMatcher."""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def check_keywords(text: str, keywords: list):
+    """
+    Return:
+      - detected_exact: list of keywords found exactly (case-insensitive substring)
+      - fuzzy_hits: dict keyword -> similarity_score (only for those above cutoff)
+    """
+    text_low = text.lower()
+    detected_exact = [kw for kw in keywords if kw.lower() in text_low]
+
+    fuzzy_hits = {}
+    # For fuzzy, compute a couple of heuristics:
+    # 1) SequenceMatcher ratio between full keyword and full text (quick approximate)
+    # 2) SequenceMatcher between keyword and best matching window of tokens
+    words = text.split()
+    for kw in keywords:
+        kw_low = kw.lower()
+        # quick full-text similarity
+        full_ratio = fuzzy_ratio(kw_low, text_low)
+        # attempt token-window comparison for multi-word keywords
+        kw_tokens = kw_low.split()
+        window_size = max(1, len(kw_tokens))
+        best_window_ratio = 0.0
+        if len(words) >= 1:
+            # create windows of tokens of size window_size, compute ratio against keyword
+            for i in range(0, max(1, len(words) - window_size + 1)):
+                window = " ".join(words[i:i + window_size]).lower()
+                r = fuzzy_ratio(kw_low, window)
+                if r > best_window_ratio:
+                    best_window_ratio = r
+        best_ratio = max(full_ratio, best_window_ratio)
+        # Also consider difflib.get_close_matches for single-word keywords
+        if len(kw_tokens) == 1:
+            close = difflib.get_close_matches(kw, words, n=1, cutoff=FUZZY_SIMILARITY_CUTOFF)
+            if close:
+                best_ratio = max(best_ratio, FUZZY_SIMILARITY_CUTOFF + 0.05)
+
+        if best_ratio >= FUZZY_SIMILARITY_CUTOFF and kw not in detected_exact:
+            fuzzy_hits[kw] = round(best_ratio, 3)
+
+    return detected_exact, fuzzy_hits
+
+
+# ------------------- SYMBOL / SEAL DETECTION -------------------
+def detect_symbol(image_path, reference_symbol_path):
+    """
+    Detect whether a reference symbol (seal/stamp) exists in the input image.
+    Returns (bool_detected, num_matches)
+    """
+    original = cv2.imread(image_path)
+    ref_symbol = cv2.imread(reference_symbol_path)
+    if original is None or ref_symbol is None:
+        return False, 0
+
+    original_gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+    ref_gray = cv2.cvtColor(ref_symbol, cv2.COLOR_BGR2GRAY)
+
+    orb = cv2.ORB_create(nfeatures=ORB_NFEATURES)
+    kp1, des1 = orb.detectAndCompute(original_gray, None)
+    kp2, des2 = orb.detectAndCompute(ref_gray, None)
+
+    if des1 is None or des2 is None:
+        return False, 0
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    # length of matches is a crude indicator
+    return (len(matches) >= MIN_SYMBOL_MATCHES), len(matches)
+
+
+def detect_any_symbol(image_path, seal_paths):
+    """
+    Try multiple seal/reference images and return the first successful detection.
+    seal_paths: iterable of file paths to try in order.
+    Returns: (detected_bool, matches, used_path or None)
+    """
+    best_matches = 0
+    best_path = None
+    best_detected = False
+
+    for p in seal_paths:
+        if not os.path.exists(p):
+            continue
+        try:
+            detected, matches = detect_symbol(image_path, p)
+        except Exception:
+            detected, matches = False, 0
+        # Track the best-match candidate (useful for debugging)
+        if matches > best_matches:
+            best_matches = matches
+            best_path = p
+            best_detected = detected
+        # If it is detected above threshold, return immediately
+        if detected:
+            return True, matches, p
+
+    # fallback: if none met threshold but some had matches, return best candidate with detected=False
+    return best_detected, best_matches, best_path
+
+
+# ------------------- STRUCTURE / LAYOUT VERIFICATION -------------------
+def check_document_structure(image_path, reference_doc_path):
+    """
+    Robust structure verification with homography alignment.
+    Aligns input to reference using ORB + homography then computes SSIM
+    on edge maps. Returns (overall_score, num_matches).
+    """
+    input_img = cv2.imread(image_path)
+    ref_img = cv2.imread(reference_doc_path)
+    if input_img is None or ref_img is None:
+        # Could not read input or reference
+        return 0.0, 0
+
+    # Convert to grayscale
+    input_gray = cv2.cvtColor(input_img, cv2.COLOR_BGR2GRAY)
+    ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
+
+    # Resize reference to match input size (preserve aspect by scaling ref)
+    try:
+        ref_gray = cv2.resize(ref_gray, (input_gray.shape[1], input_gray.shape[0]))
+    except Exception:
+        ref_gray = cv2.resize(ref_gray, (input_gray.shape[1], input_gray.shape[0]))
+
+    # Histogram equalization to reduce brightness/contrast differences
+    try:
+        input_gray = cv2.equalizeHist(input_gray)
+        ref_gray = cv2.equalizeHist(ref_gray)
+    except Exception:
+        # If equalize fails for any reason, continue with original grays
+        pass
+
+    # Feature detection and matching
+    orb = cv2.ORB_create(nfeatures=ORB_NFEATURES)
+    kp1, des1 = orb.detectAndCompute(input_gray, None)
+    kp2, des2 = orb.detectAndCompute(ref_gray, None)
+
+    if des1 is None or des2 is None or not kp1 or not kp2:
+        return 0.0, 0
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    num_matches = len(matches)
+    if num_matches < MIN_ALIGNMENT_MATCHES:
+        # Not enough matches to reliably align
+        # Compute a weak SSIM on edges without alignment but mark low score
+        edges_input = cv2.Canny(input_gray, 80, 200)
+        edges_ref = cv2.Canny(ref_gray, 80, 200)
+        try:
+            structure_score = float(ssim(edges_input, edges_ref))
+        except Exception:
+            structure_score = 0.0
+        layout_match_ratio = num_matches / max(len(kp1), 1)
+        overall_score = (structure_score * SSIM_WEIGHT) + (layout_match_ratio * LAYOUT_WEIGHT)
+        return float(overall_score), int(num_matches)
+
+    # Prepare matched keypoints for homography
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+    # Find homography and warp input to reference coordinates
+    try:
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    except Exception:
+        H = None
+        mask = None
+
+    if H is not None:
+        try:
+            aligned_input = cv2.warpPerspective(input_gray, H, (ref_gray.shape[1], ref_gray.shape[0]))
+        except Exception:
+            aligned_input = input_gray
+    else:
+        aligned_input = input_gray
+
+    # Edge maps and SSIM
+    edges_input = cv2.Canny(aligned_input, 80, 200)
+    edges_ref = cv2.Canny(ref_gray, 80, 200)
+    try:
+        structure_score = float(ssim(edges_input, edges_ref))
+    except Exception:
+        structure_score = 0.0
+
+    # Layout match ratio (normalized by number of keypoints in input)
+    layout_match_ratio = num_matches / max(len(kp1), 1)
+
+    overall_score = (structure_score * SSIM_WEIGHT) + (layout_match_ratio * LAYOUT_WEIGHT)
+    return float(overall_score), int(num_matches)
+
+
+# ------------------- MAIN VERIFICATION FUNCTION -------------------
+def verify_document(image_path, doc_category, doc_type, ref_folder='reference_documents'):
+    """
+    image_path: path to input image
+    doc_category: category folder under reference_documents (e.g., 'board', 'gov', etc.)
+    doc_type: one of 'ssc', 'hsc', 'cet', 'aadhaar', 'domicile', etc.
+    ref_folder: base folder that stores reference images organized as:
+                reference_documents/{doc_category}/{doc_type}_ref.jpg
+                and optional seals:
+                reference_documents/{doc_category}/{doc_type}_seal.jpg
+                reference_documents/{doc_category}/{doc_type}_seal_alt.jpg
+                reference_documents/{doc_category}/{doc_type}_seal2.jpg
+    Returns: dict with verification results
+    """
+    # Build reference path (primary reference used for structure and seal detection)
+    ref_file_name = f"{doc_type.lower()}_ref.jpg"
+    ref_path = os.path.join(ref_folder, doc_category.lower(), ref_file_name)
+
+    # Choose keyword set
+    doc_type_l = doc_type.lower()
+    keywords = KEYWORD_SETS.get(doc_type_l, [])
+
+    # Ensure image exists
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Input image not found: {image_path}")
+
+    # Extract text (OCR)
+    try:
+        text = extract_text(image_path)
+    except Exception as e:
+        text = ""
+        print(f"[Warning] OCR failed: {e}")
+
+    # Keywords detection
+    detected_keywords, fuzzy_matches = check_keywords(text, keywords)
+    keyword_score = (len(detected_keywords) / len(keywords)) if keywords else 0.0
+
+    # Structure check (if reference exists)
+    structure_score = 0.0
+    structure_matches = 0
+    if os.path.exists(ref_path):
+        try:
+            structure_score, structure_matches = check_document_structure(image_path, ref_path)
+        except Exception as e:
+            print(f"[Warning] Structure check error: {e}")
+            structure_score, structure_matches = 0.0, 0
+    else:
+        # No reference available
+        print(f"[Info] Reference not found at {ref_path}. Skipping structure verification.")
+
+    # Seal detection (only for doc types that commonly have seals)
+    seal_detected = False
+    seal_matches = 0
+    used_seal_path = None
+
+    # For the marksheets and CET we will attempt multiple seal files in order
+    if doc_type_l in ['aadhaar', 'domicile', 'ssc', 'hsc', 'cet']:
+        # Candidate seal file names to try (ordered)
+        candidate_seals = [
+            os.path.join(ref_folder, doc_category.lower(), f"{doc_type_l}_seal.jpg"),
+            os.path.join(ref_folder, doc_category.lower(), f"{doc_type_l}_seal_alt.jpg"),
+            os.path.join(ref_folder, doc_category.lower(), f"{doc_type_l}_seal2.jpg")
+        ]
+        # Also consider using the primary reference image as fallback seal reference
+        # (some refs include the seal region clearly)
+        if os.path.exists(ref_path):
+            candidate_seals.append(ref_path)
+
+        detected, matches, path_used = detect_any_symbol(image_path, candidate_seals)
+        seal_detected = bool(detected and matches >= 1 and detected is True)
+        # If detect_any_symbol returned a best candidate that had matches but not a pass,
+        # we'll still store the best matches count
+        if matches:
+            seal_matches = int(matches)
+            used_seal_path = path_used
+
+    # Decision heuristics
+    try:
+        if (keyword_score >= KEYWORD_VERIFIED_THRESHOLD and
+                structure_score > STRUCTURE_VERIFIED_THRESHOLD and
+                (seal_detected or doc_type_l not in ['aadhaar', 'domicile','ssc','hsc', 'cet'])):
+            verification_level = "Verified"
+        elif keyword_score > 0.15 or structure_score > 0.2:
+            verification_level = "Needs Manual Verification"
+        else:
+            verification_level = "Rejected"
+    except Exception:
+        verification_level = "Unknown"
+
+    result = {
+        'doc_type': doc_type,
+        'doc_category': doc_category,
+        'image_path': image_path,
+        'reference_path': ref_path if os.path.exists(ref_path) else None,
+        'text': text,
+        'detected_keywords': detected_keywords,
+        'fuzzy_matches': fuzzy_matches,
+        'keyword_score': round(float(keyword_score), 4),
+        'structure_score': round(float(structure_score), 4),
+        'structure_matches': int(structure_matches),
+        'seal_detected': bool(seal_detected),
+        'seal_matches': int(seal_matches),
+        'seal_used_path': used_seal_path,
+        'verification_level': verification_level
+    }
+    return result
+
+
+# ------------------- CLI ENTRYPOINT -------------------
+def main():
+    parser = argparse.ArgumentParser(description="Document verification tool (merged)")
+    parser.add_argument('--image', '-i', required=True, help='Path to input image')
+    parser.add_argument('--doc_category', '-c', default='general', help='Reference category folder')
+    parser.add_argument('--doc_type', '-t', required=True,
+                        help='Document type (ssc, hsc, cet, aadhaar, domicile, etc.)')
+    parser.add_argument('--ref_folder', '-r', default='reference_documents', help='Base reference folder')
+    parser.add_argument('--pretty', action='store_true', help='Pretty-print JSON result')
+    args = parser.parse_args()
+
+    try:
+        result = verify_document(args.image, args.doc_category, args.doc_type, ref_folder=args.ref_folder)
+    except Exception as e:
+        print(json.dumps({'error': str(e)}, ensure_ascii=False))
+        return
+
+    if args.pretty:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

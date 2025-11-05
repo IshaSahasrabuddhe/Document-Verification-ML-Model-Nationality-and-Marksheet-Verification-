@@ -1,0 +1,224 @@
+import cv2
+import easyocr
+import numpy as np
+import difflib
+from skimage.metrics import structural_similarity as ssim
+import os
+import re
+
+# ============================================================
+#                    DOCUMENT KEYWORDS
+# ============================================================
+SSC_KEYWORDS = [
+    "महाराष्ट्र राज्य माध्यमिक व उच्च माध्यमिक शिक्षण मंडळ",
+    "Maharashtra State Board Of Secondary and Higher Secondary Education, Pune",
+    "पुणे विभागीय मंडळ", "PUNE DIVISIONAL BOARD",
+    "माध्यमिक शालान्त प्रमाणपत्र परीक्षा गुणपत्रक",
+    "SECONDARY SCHOOL CERTIFICATE EXAMINATION - STATEMENT OF MARKS",
+    "आसन क्रमांक", "SEAT NO.",
+    "जिल्हा व शाळा क्रमांक", "DIST. & SCHOOL NO.",
+    "परीक्षेचे वर्ष", "YEAR OF EXAM",
+    "केंद्र क्रमांक", "CENTRE NO.",
+    "गुणपत्रिकेचा अनुक्रमांक", "SR.NO. OF STATEMENT",
+    "उमेदवाराचे संपूर्ण नाव", "CANDIDATE'S FULL NAME",
+    "उमेदवाराच्या आईचे नाव", "CANDIDATE'S MOTHER'S NAME",
+    "विषयाचा सांकेतिक क्रमांक व विषयाचे नाव", "Subject Code No. and Subject Name",
+    "प्राप्त गुण किंवा श्रेणी", "Marks or Grade Obtained",
+    "अक्षरात", "In Words", "Percentage", "टक्केवारी",
+    "निकाल", "Result", "Divisional Secretary"
+]
+
+HSC_KEYWORDS = [
+    "महाराष्ट्र राज्य माध्यमिक व उच्च माध्यमिक शिक्षण मंडळ",
+    "Maharashtra State Board Of Secondary and Higher Secondary Education",
+    "पुणे विभागीय मंडळ", "PUNE DIVISIONAL BOARD",
+    "उच्च माध्यमिक प्रमाणपत्र परीक्षा गुणपत्रक", "HIGHER SECONDARY CERTIFICATE EXAMINATION",
+    "शाखा", "STREAM", "SCIENCE",
+    "आसन क्रमांक", "SEAT NO.", "केंद्र क्रमांक", "CENTRE NO",
+    "परीक्षेचा महिना वर्षानु", "MONTH & YEAR OF EXAM",
+    "उमेदवाराचे संपूर्ण नाव", "CANDIDATE'S FULL NAME",
+    "उमेदवाराच्या आईचे नाव", "CANDIDATE'S MOTHER'S NAME",
+    "विषयाचा सांकेतिक क्रमांक व विषयाचे नाव", "Subject Code No. and Subject Name",
+    "प्राप्त गुण किया श्रेष्णी", "Marks or Grade Obtained",
+    "अक्षरात", "In Words", "Percentage", "टक्केवारी",
+    "निकाल", "Result", "Divisional Secretary"
+]
+
+CET_KEYWORDS = [
+    "Government of Maharashtra",
+    "State Common Entrance Test Cell, Maharashtra State, Mumbai",
+    "MHT-CET (PCM Group) Score Card",
+    "Application Number",
+    "Candidate's Full Name",
+    "Candidate's Father's/Husband's First Name",
+    "Candidate's Mother's First Name",
+    "Roll No",
+    "Category",
+    "CET Course",
+    "MHT CET Percentile Score",
+    "Physics", "Chemistry", "Mathematics",
+    "Total Percentile Score PCM",
+    "Date of the Result",
+    "IP address of the Computer from which Score Card Downloaded",
+    "Date and Time of Downloading the Score Card",
+    "valid only for the academic year",
+    "MHT CET Score is NOT the same as PERCENTAGE"
+]
+
+PASSPORT_KEYWORDS = [
+    "REPUBLIC OF INDIA", "IND", "INDIAN", "Indian Passport",
+    "Address", "Name of Father", "Name of Mother", "MAHARASHTRA",
+    "Type", "Code", "Passport No.", "Surname", "Given Name(s)",
+    "Nationality", "Date of Birth", "Place of Birth", "Sex",
+    "Date of Issue", "Date of Expiry", "Place of Issue",
+    "भारताचे प्रजासत्ताक", "भारतीय", "पत्ता", "वडिलांचे नाव", "मातेचे नाव", "लिंग",
+    "जन्म तारीख", "जन्म स्थान", "राष्ट्रीयत्व", "जारी तारीख", "कालबाह्यता तारीख", "जारी ठिकाण"
+]
+
+DOMICILE_KEYWORDS = [
+    "Tahsil Office", "Certificate of Age, Nationality and Domicile",
+    "Issued by Authorities in the State of Maharashtra",
+    "State of 'MAHARASHTRA'", "Nationality", "Domicile", "Certificate",
+    "CITIZEN OF INDIA", "PARTICULARS OF PROOFS SUBMITTED", "Signature valid", "Seal"
+]
+
+# ============================================================
+#               IMAGE PREPROCESSING + OCR
+# ============================================================
+def preprocess_image(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"❌ Could not read image at {image_path}")
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Improve contrast and remove noise
+    gray = cv2.convertScaleAbs(gray, alpha=1.3, beta=10)
+    gray = cv2.fastNlMeansDenoising(gray, h=15)
+    thresh = cv2.adaptiveThreshold(gray, 255,
+                                   cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 31, 2)
+    return thresh
+
+
+def extract_text(image_path):
+    image = preprocess_image(image_path)
+    reader = easyocr.Reader(['en', 'mr'])
+    results = reader.readtext(image, detail=0, paragraph=True)
+    text = " ".join(results)
+    return re.sub(r'\s+', ' ', text).strip()
+
+# ============================================================
+#                 KEYWORD DETECTION (IMPROVED)
+# ============================================================
+def check_keywords(text, keywords):
+    text_lower = text.lower()
+    detected = []
+    fuzzy_hits = []
+    for kw in keywords:
+        kw_low = kw.lower()
+        if kw_low in text_lower:
+            detected.append(kw)
+        else:
+            close = difflib.get_close_matches(kw_low, text_lower.split(), n=1, cutoff=0.7)
+            if close:
+                fuzzy_hits.append(kw)
+    score = (len(detected) + 0.5 * len(fuzzy_hits)) / len(keywords)
+    return detected, fuzzy_hits, round(score, 3)
+
+# ============================================================
+#           STRUCTURE MATCHING (HOMOGRAPHY + SSIM)
+# ============================================================
+def check_document_structure(image_path, ref_path):
+    try:
+        img1 = cv2.imread(image_path)
+        img2 = cv2.imread(ref_path)
+        if img1 is None or img2 is None:
+            print("❌ Could not load input/reference image")
+            return 0.0
+
+        img1_gray = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        img2_gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+        img2_gray = cv2.resize(img2_gray, (img1_gray.shape[1], img1_gray.shape[0]))
+
+        orb = cv2.ORB_create(nfeatures=2000)
+        kp1, des1 = orb.detectAndCompute(img1_gray, None)
+        kp2, des2 = orb.detectAndCompute(img2_gray, None)
+
+        if des1 is None or des2 is None:
+            return 0.0
+
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = matcher.match(des1, des2)
+        matches = sorted(matches, key=lambda x: x.distance)
+        if len(matches) < 10:
+            return 0.0
+
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1,1,2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1,1,2)
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+        if H is not None:
+            aligned = cv2.warpPerspective(img1_gray, H, (img2_gray.shape[1], img2_gray.shape[0]))
+        else:
+            aligned = img1_gray
+
+        edges1 = cv2.Canny(aligned, 50, 150)
+        edges2 = cv2.Canny(img2_gray, 50, 150)
+        ssim_score = ssim(edges1, edges2)
+        layout_ratio = len(matches) / max(len(kp1), 1)
+
+        return round((0.7 * ssim_score + 0.3 * layout_ratio), 3)
+
+    except Exception as e:
+        print("⚠️ Error in structure check:", e)
+        return 0.0
+
+# ============================================================
+#                     MAIN VERIFICATION
+# ============================================================
+def verify_document(image_path, doc_category, doc_type):
+    ref_path = os.path.join('reference_documents', doc_category.lower(), f"{doc_type.lower()}_ref.jpg")
+
+    if doc_type.lower() == 'ssc':
+        keywords = SSC_KEYWORDS
+    elif doc_type.lower() == 'hsc':
+        keywords = HSC_KEYWORDS
+    elif doc_type.lower() == 'cet':
+        keywords = CET_KEYWORDS
+    elif doc_type.lower() == 'passport':
+        keywords = PASSPORT_KEYWORDS
+    elif doc_type.lower() == 'domicile':
+        keywords = DOMICILE_KEYWORDS
+    else:
+        keywords = []
+
+    text = extract_text(image_path)
+    detected, fuzzy, keyword_score = check_keywords(text, keywords)
+    structure_score = check_document_structure(image_path, ref_path)
+
+    # Determine Verification Level
+    if keyword_score >= 0.3 and structure_score >= 0.5:
+        level = "🟢 Verified"
+    elif keyword_score >= 0 or structure_score >= 0:
+        level = "🟠 Needs Manual Verification"
+    else:
+        level = "🔴 Rejected"
+
+    return {
+        "text": text,
+        "detected_keywords": detected,
+        "fuzzy_matches": fuzzy,
+        "keyword_score": keyword_score,
+        "structure_score": structure_score,
+        "verification_level": level,
+        "doc_type": doc_type,
+        "doc_category": doc_category
+    }
+
+# ============================================================
+# Example Run
+# ============================================================
+if __name__ == "__main__":
+    result = verify_document("isha12thmrk.jpg", "marksheet", "hsc")
+    for k, v in result.items():
+        print(f"{k}: {v}")

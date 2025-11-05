@@ -1,0 +1,253 @@
+import cv2
+import pytesseract
+import numpy as np
+import difflib
+from skimage.metrics import structural_similarity as ssim
+import os
+
+# ------------------- KEYWORDS -------------------
+SSC_KEYWORDS = [
+    "महाराष्ट्र राज्य माध्यमिक व उच्च माध्यमिक शिक्षण मंडळ",
+    "Maharashtra State Board Of Secondary and Higher Secondary Education, Pune",
+    "पुणे विभागीय मंडळ", "PUNE DIVISIONAL BOARD",
+    "माध्यमिक शालान्त प्रमाणपत्र परीक्षा गुणपत्रक",
+    "SECONDARY SCHOOL CERTIFICATE EXAMINATION - STATEMENT OF MARKS",
+    "आसन क्रमांक", "SEAT NO.",
+    "जिल्हा व शाळा क्रमांक", "DIST. & SCHOOL NO.",
+    "परीक्षेचे वर्ष", "YEAR OF EXAM",
+    "केंद्र क्रमांक", "CENTRE NO.",
+    "गुणपत्रिकेचा अनुक्रमांक", "SR.NO. OF STATEMENT",
+    "उमेदवाराचे संपूर्ण नाव", "CANDIDATE'S FULL NAME",
+    "उमेदवाराच्या आईचे नाव", "CANDIDATE'S MOTHER'S NAME",
+    "विषयाचा सांकेतिक क्रमांक व विषयाचे नाव", "Subject Code No. and Subject Name",
+    "प्राप्त गुण किंवा श्रेणी", "Marks or Grade Obtained",
+    "अक्षरात", "In Words", "Percentage", "टक्केवारी",
+    "निकाल", "Result", "Divisional Secretary"
+]
+SSC_IDENTIFIERS = ["SECONDARY SCHOOL CERTIFICATE EXAMINATION", "Maharashtra State Board"]
+
+HSC_KEYWORDS = [
+   "महाराष्ट्र राज्य माध्यमिक व उच्च माध्यमिक शिक्षण मंडळ",
+    "Maharashtra State Board Of Secondary and Higher Secondary Education",
+    "पुणे विभागीय मंडळ", "PUNE DIVISIONAL BOARD",
+    "उच्च माध्यमिक प्रमाणपत्र परीक्षा गुणपत्रक", "HIGHER SECONDARY CERTIFICATE EXAMINATION",
+    "शाखा", "STREAM", "SCIENCE",
+    "आसन क्रमांक", "SEAT NO.", "केंद्र क्रमांक", "CENTRE NO",
+    "परीक्षेचा महिना वर्षानु", "MONTH & YEAR OF EXAM",
+    "उमेदवाराचे संपूर्ण नाव", "CANDIDATE'S FULL NAME",
+    "उमेदवाराच्या आईचे नाव", "CANDIDATE'S MOTHER'S NAME",
+    "विषयाचा सांकेतिक क्रमांक व विषयाचे नाव", "Subject Code No. and Subject Name",
+    "प्राप्त गुण किया श्रेष्णी", "Marks or Grade Obtained",
+    "अक्षरात", "In Words", "Percentage", "टक्केवारी",
+    "निकाल", "Result", "Divisional Secretary"
+]
+
+CET_KEYWORDS = [
+     "Government of Maharashtra",
+    "State Common Entrance Test Cell, Maharashtra State, Mumbai",
+    "MHT-CET (PCM Group) Score Card",
+    "Application Number",
+    "Candidate's Full Name",
+    "Candidate's Father's/Husband's First Name",
+    "Candidate's Mother's First Name",
+    "Roll No",
+    "Category",
+    "CET Course",
+    "MHT CET Percentile Score",
+    "Physics",
+    "Chemistry",
+    "Mathematics",
+    "Total Percentile Score PCM",
+    "Date of the Result",
+    "IP address of the Computer from which Score Card Downloaded",
+    "Date and Time of Downloading the Score Card",
+    "This CET Score is valid only for the academic year",
+    "MHT CET Score is NOT the same as PERCENTAGE"
+]
+CET_IDENTIFIERS = ["MHT-CET (PCM Group) Score Card", "Government of Maharashtra"]
+
+PASSPORT_KEYWORDS = [
+    "REPUBLIC OF INDIA", "IND", "INDIAN", "Indian Passport", "Address", "Name of Father",
+    "Name of Mother", "MAHARASHTRA", "Type", "Code", "Passport No.", "Surname",
+    "Given Name(s)", "Nationality", "Date of Birth", "Place of Birth", "Sex",
+    "Date of Issue", "Date of Expiry", "Place of Issue",
+    "भारताचे प्रजासत्ताक", "भारतीय", "पत्ता", "वडिलांचे नाव", "मातेचे नाव", "लिंग",
+    "जन्म तारीख", "जन्म स्थान", "राष्ट्रीयत्व", "जारी तारीख", "कालबाह्यता तारीख", "जारी ठिकाण"
+]
+
+DOMICILE_KEYWORDS = [
+    "Tahsil Office", "Certificate of Age, Nationality and Domicile", 
+    "Issued by Authorities in the State of Maharashtra",
+    "State of 'MAHARASHTRA'", "Nationality", "Domicile", "Certificate",
+    "CITIZEN OF INDIA", "PARTICULARS OF PROOFS SUBMITTED", "Signature valid", "Seal"
+]
+
+# ------------------- OCR & TEXT EXTRACTION -------------------
+def preprocess_image(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Could not read image at {image_path}")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
+    return img, thresh
+
+def extract_text(image_path):
+    _, preprocessed = preprocess_image(image_path)
+    config = r'--oem 3 --psm 6'
+    text = pytesseract.image_to_string(preprocessed, config=config)
+    return text
+
+# ------------------- KEYWORD DETECTION -------------------
+def check_keywords(text, keywords):
+    detected_keywords = [kw for kw in keywords if kw.lower() in text.lower()]
+    fuzzy_matches = {
+        kw: difflib.get_close_matches(kw, text.split(), n=1, cutoff=0.6)
+        for kw in keywords
+    }
+    return detected_keywords, fuzzy_matches
+
+# ------------------- SYMBOL / SEAL DETECTION -------------------
+def detect_symbol(image_path, reference_symbol_path):
+    try:
+        original = cv2.imread(image_path)
+        ref_symbol = cv2.imread(reference_symbol_path)
+        if original is None or ref_symbol is None:
+            return False, 0
+
+        original_gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+        ref_gray = cv2.cvtColor(ref_symbol, cv2.COLOR_BGR2GRAY)
+
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.detectAndCompute(original_gray, None)
+        kp2, des2 = orb.detectAndCompute(ref_gray, None)
+
+        if des1 is None or des2 is None:
+            return False, 0
+
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(des1, des2)
+
+        return (len(matches) > 20), len(matches)
+    except Exception as e:
+        print(f"Error detecting symbol: {e}")
+        return False, 0
+
+# ------------------- STRUCTURE / LAYOUT VERIFICATION (IMPROVED) -------------------
+def check_document_structure(image_path, reference_doc_path):
+    """
+    Robust structure verification with homography alignment.
+    Aligns images using ORB features before SSIM comparison.
+    Returns (overall_score, match_count).
+    """
+    try:
+        input_img = cv2.imread(image_path)
+        ref_img = cv2.imread(reference_doc_path)
+        if input_img is None or ref_img is None:
+            print("❌ Could not read one of the images.")
+            return 0.0, 0
+
+        # Convert to grayscale
+        input_gray = cv2.cvtColor(input_img, cv2.COLOR_BGR2GRAY)
+        ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
+
+        # Resize reference to match input size
+        ref_gray = cv2.resize(ref_gray, (input_gray.shape[1], input_gray.shape[0]))
+
+        # Equalize brightness
+        input_gray = cv2.equalizeHist(input_gray)
+        ref_gray = cv2.equalizeHist(ref_gray)
+
+        # --- Step 1: Feature Matching for Alignment ---
+        orb = cv2.ORB_create(nfeatures=1500)
+        kp1, des1 = orb.detectAndCompute(input_gray, None)
+        kp2, des2 = orb.detectAndCompute(ref_gray, None)
+
+        if des1 is None or des2 is None:
+            print("⚠️ No descriptors found.")
+            return 0.0, 0
+
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(des1, des2)
+        matches = sorted(matches, key=lambda x: x.distance)
+
+        if len(matches) < 10:
+            print("⚠️ Not enough matches for alignment.")
+            return 0.0, len(matches)
+
+        # Extract matched keypoints
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+        # Find homography (perspective alignment)
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        if H is not None:
+            aligned_input = cv2.warpPerspective(input_gray, H, (ref_gray.shape[1], ref_gray.shape[0]))
+        else:
+            aligned_input = input_gray
+
+        # --- Step 2: Structural Similarity (on aligned images) ---
+        edges_input = cv2.Canny(aligned_input, 80, 200)
+        edges_ref = cv2.Canny(ref_gray, 80, 200)
+        structure_score, _ = ssim(edges_input, edges_ref, full=True)
+
+        # --- Step 3: Layout Match Ratio ---
+        layout_match_ratio = len(matches) / max(len(kp1), 1)
+        overall_score = (structure_score * 0.6) + (layout_match_ratio * 0.4)
+
+        return overall_score, len(matches)
+    except Exception as e:
+        print(f"Error in structure check: {e}")
+        return 0.0, 0
+
+
+# ------------------- MAIN VERIFICATION FUNCTION -------------------
+def verify_document(image_path, doc_category, doc_type):
+    ref_path = os.path.join('reference_documents', doc_category.lower(), f"{doc_type.lower()}_ref.jpg")
+
+    if doc_type.lower() == 'ssc':
+        keywords = SSC_KEYWORDS
+    elif doc_type.lower() == 'hsc':
+        keywords = HSC_KEYWORDS
+    elif doc_type.lower() == 'cet':
+        keywords = CET_KEYWORDS
+    elif doc_type.lower() == 'passport':
+        keywords = PASSPORT_KEYWORDS
+    elif doc_type.lower() == 'domicile':
+        keywords = DOMICILE_KEYWORDS
+    else:
+        keywords = []
+
+    text = extract_text(image_path)
+    detected_keywords, fuzzy_matches = check_keywords(text, keywords)
+    keyword_score = len(detected_keywords) / len(keywords) if keywords else 0
+
+    structure_score, structure_matches = check_document_structure(image_path, ref_path)
+
+    seal_detected = False
+    seal_matches = 0
+    if doc_type.lower() in ['passport', 'domicile']:
+        seal_detected, seal_matches = detect_symbol(image_path, ref_path)
+
+    if keyword_score > 0.3 and structure_score > 0.5 and (seal_detected or doc_type.lower() not in ['passport', 'domicile']):
+        verification_level = "Verified"
+    elif keyword_score > 0.1 or structure_score > 0.4:
+        verification_level = "Needs Manual Verification"
+    else:
+        verification_level = "Rejected"
+
+    return {
+        'text': text,
+        'detected_keywords': detected_keywords,
+        'keyword_score': keyword_score,
+        'structure_score': structure_score,
+        'structure_matches': structure_matches,
+        'seal_detected': seal_detected,
+        'seal_matches': seal_matches,
+        'verification_level': verification_level,
+        'doc_type': doc_type,
+        'doc_category': doc_category
+    }
